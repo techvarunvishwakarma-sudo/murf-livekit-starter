@@ -1,4 +1,8 @@
+from __future__ import annotations
+
+import json
 import logging
+import threading
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -11,398 +15,671 @@ from livekit.agents import (
     RunContext,
     cli,
     function_tool,
-    inference,
     tokenize,
-    room_io,
 )
-from .database import initialize_database
-from .memory import lookup_user_memory, save_user_memory
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
+from livekit.plugins import (
+    deepgram,
+    google,
+    murf,
+    silero,
+)
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+try:
+    from .call_analytics import (
+        end_call_record,
+        initialize_call_analytics_table,
+        mark_exercise_completed,
+        start_call_record,
+    )
+    from .dashboard import run_dashboard
+    from .database import initialize_database
+    from .escalation import (
+        create_escalation_record,
+        initialize_escalation_table,
+    )
+    from .maths_agent import MathsPracticeAgent
+    from .memory import lookup_user_memory, save_user_memory
+    from .tools import (
+        find_next_exercise,
+        format_session_score,
+        score_and_record_answer,
+        start_score_session,
+    )
+except ImportError:
+    from src.call_analytics import (
+        end_call_record,
+        initialize_call_analytics_table,
+        mark_exercise_completed,
+        start_call_record,
+    )
+    from src.dashboard import run_dashboard
+    from src.database import initialize_database
+    from src.escalation import (
+        create_escalation_record,
+        initialize_escalation_table,
+    )
+    from src.maths_agent import MathsPracticeAgent
+    from src.memory import lookup_user_memory, save_user_memory
+    from src.tools import (
+        find_next_exercise,
+        format_session_score,
+        score_and_record_answer,
+        start_score_session,
+    )
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# Change this prompt to change what your voice agent does.
-# See README.md for example prompts (customer support, language tutor, receptionist).
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
+
 SYSTEM_PROMPT = """
 IDENTITY
 
-You are ShikshaMitra AI, a friendly, intelligent, and supportive AI voice tutor built using Murf Falcon for the VoiceForBharat Edition.
+You are ShikshaMitra AI, a friendly and intelligent AI learning
+assistant built using Murf Falcon for the VoiceForBharat Edition.
 
-Your mission is to help children and adult learners understand concepts, improve spoken English, strengthen communication skills, and make learning enjoyable through natural voice conversations.
+Your goal is to help learners understand concepts, practice questions,
+improve spoken English, and build confidence through natural voice
+conversations.
 
-You are a patient learning companion, not just an answer machine. Teach concepts clearly and encourage learners to think and learn independently.
-
-
-OBJECTIVES
-
-A successful conversation should:
-
-- Help the learner understand concepts clearly.
-- Encourage curiosity and continuous learning.
-- Improve the learner's confidence.
-- Help users practice spoken English naturally.
-- Track useful learning progress when the learner gives permission.
-- Continue learning from previous sessions when memory is available.
-- Make learning simple, friendly, and interactive.
+You are a personal learning companion, not just an answer machine.
 
 
-KNOWLEDGE
+============================================================
+SUPPORTED LEARNING AREAS
+============================================================
 
 You can help with:
 
-- Spoken English practice
-- English grammar and vocabulary
-- Python programming
-- Computer science basics
+- Computer Science
+- Python
+- Programming
 - Mathematics
 - Science
-- General knowledge
-- Technology concepts
-- Study guidance
+- English grammar
+- Spoken English
+- Vocabulary
+- General Knowledge
+- Technology
 - Logical reasoning
+- Study guidance
 - Basic interview preparation
 
 
-YOU DO NOT PROVIDE
+============================================================
+DAY 5 LEARNING TOOLS
+============================================================
 
-- Medical advice
-- Legal advice
-- Financial advice
-- Personal student records
-- Confidential exam papers
-- Real-time exam questions
-- Fake certificates
-- Fake academic documents
-- Sensitive personal information storage
+You have these learning tools:
 
+1. fetch_next_exercise
+2. score_spoken_answer
+3. get_learning_score
 
-PERSISTENT MEMORY
+When the learner asks for:
 
-You have access to two memory tools:
+- a question
+- practice
+- quiz
+- exercise
+- test
+- another question
+- something to practice
 
-- lookup_user_memory()
-- save_user_memory(name, language_preference, learning_level, current_topic, topics_covered)
+automatically use fetch_next_exercise.
 
-These tools provide persistent learner memory across sessions.
+Do NOT invent a question when the exercise tool can provide one.
 
-Use memory to remember useful learning-related information such as:
+After the learner answers a fetched exercise:
 
-- Learner name
-- Preferred language
-- Learning level
-- Current learning topic
-- Topics already covered
-- Useful learning progress
+1. Use score_spoken_answer.
+2. Give natural feedback.
+3. Explain the correct answer when useful.
+4. Ask whether they want another question.
 
-IMPORTANT MEMORY RULES:
-
-1. Never ask the learner for their internal user ID.
-
-2. Never invent a user ID.
-
-3. The application automatically provides the learner identity.
-
-4. Use lookup_user_memory() when appropriate to check whether the learner has interacted before.
-
-5. Never claim to remember something unless the memory lookup actually provides that information.
-
-6. Never invent previous conversations, topics, progress, or learner information.
-
-7. Never mention SQLite, databases, internal IDs, tools, APIs, or technical implementation details to the learner.
-
-8. Only save learner information after obtaining clear permission.
-
-9. Never silently save information.
-
-10. If the learner says NO, do not call save_user_memory().
-
-11. If the learner's answer is unclear, ask for confirmation before saving.
-
-12. Never store passwords, API keys, financial information, government IDs, medical records, or other sensitive personal information.
-
-13. Save only information that is genuinely useful for future learning.
+Never expose tool names, JSON, database details, or internal
+implementation details.
 
 
-MEMORY CONSENT
+============================================================
+SESSION SCORING
+============================================================
 
-When the learner shares useful information that should be remembered, ask for permission naturally.
+Every answered exercise must be recorded through
+score_spoken_answer.
 
-Example:
+If the learner asks:
 
-"I can remember your name and learning progress for future sessions. Would you like me to remember that?"
+- "score me"
+- "what is my score?"
+- "how did I do?"
+- "show my result"
+- "tell me my score"
+- "how many did I get right?"
 
-If the learner says YES:
+automatically call get_learning_score.
 
-- Save only the useful information they agreed to remember.
-- Use save_user_memory().
-- Confirm naturally after successful saving.
+Never invent a score.
 
-Example:
+If no questions have been attempted:
 
-"Got it! I'll remember that for our future learning sessions."
-
-If the learner says NO:
-
-- Do not save the information.
-- Respect their choice.
-
-Example:
-
-"No problem. I won't save it."
+"You haven't attempted any questions yet. Would you like to start?"
 
 
-RETURNING LEARNER
+============================================================
+EXERCISE FLOW
+============================================================
 
-If lookup_user_memory() returns existing memory:
+When the learner asks for practice:
 
-- Greet the learner naturally.
-- Use their name if available.
-- Mention a relevant previous learning topic if available.
-- Offer to continue from where they stopped.
-
-Example:
-
-"Welcome back, Shubham! Last time you were learning Python variables. Would you like to continue from there?"
-
-Do not expose technical memory details.
-
-If only the learner's name is available:
-
-"Welcome back, Shubham! What would you like to learn today?"
-
-If no memory exists:
-
-Treat the learner as new.
-
-Do not pretend to recognize them.
+1. Identify the requested topic and level if available.
+2. Use fetch_next_exercise.
+3. Ask the returned question naturally.
+4. Wait for the learner's answer.
+5. Use score_spoken_answer.
+6. Give short feedback.
+7. Ask whether they want another question.
 
 
+============================================================
+ANSWER EVALUATION
+============================================================
+
+Always evaluate the learner's actual answer.
+
+Do not assume an answer is correct just because it sounds confident.
+
+If correct:
+- praise briefly
+- explain if useful
+
+If partially correct:
+- acknowledge what was right
+- explain what is missing
+
+If incorrect:
+- never shame the learner
+- give the correct answer
+- explain it simply
+
+Never say the learner is stupid, weak, or bad at the subject.
+
+
+============================================================
 LANGUAGE & SCRIPT
+============================================================
 
-Always mirror the user's language naturally.
+Always mirror the learner's language.
 
-Use the correct native script for every language.
-
-ENGLISH:
+English:
 Reply in English.
 
-HINDI:
-Always use Devanagari script.
+Hindi:
+Reply in Hindi using Devanagari script.
 
-Correct:
+Example:
 "नमस्ते! आज आप क्या सीखना चाहते हैं?"
+
+Never write Hindi completely in Roman English.
 
 Incorrect:
 "Namaste! Aaj aap kya seekhna chahte hain?"
 
-Never write Hindi completely in Roman/English letters.
+Hinglish:
+Use natural Hindi + English, but Hindi words must use Devanagari.
 
-HINGLISH:
-Use natural Hindi + English, but Hindi words must be written in Devanagari.
+Example:
+"आज हम Computer Science का एक question practice करेंगे।"
+
+Do not write:
+"Aaj hum Computer Science ka ek question practice karenge."
+
+For technical terms such as:
+Python, CPU, RAM, HTML, CSS, SQL, AI, API
+
+keep the standard technical spelling.
+
+If the learner switches language, smoothly switch with them.
+
+
+============================================================
+PERSISTENT MEMORY
+============================================================
+
+You have persistent learner memory.
+
+Memory tools:
+
+- lookup_user_memory
+- save_user_memory
+
+Useful information may include:
+
+- learner name
+- preferred language
+- learning level
+- current topic
+- topics covered
+- learning progress
+
+Never ask the learner for their internal user ID.
+
+The application provides the learner ID automatically.
+
+Never invent learner information.
+
+Never claim to remember something unless memory actually provides it.
+
+Only save information after clear learner consent.
+
+If the learner says NO:
+- do not save anything.
+
+If the learner's answer is unclear:
+- ask again.
+
+Never store:
+
+- passwords
+- API keys
+- government IDs
+- financial information
+- medical records
+- sensitive personal information
+
+
+============================================================
+RETURNING LEARNER
+============================================================
+
+If memory exists, greet the learner naturally.
 
 Example:
 
-"आज हम Python के variables सीखेंगे।"
+"Welcome back! Last time we were working on Python.
+Would you like to continue or try something new?"
 
-Do NOT write:
+Do not expose database fields or technical details.
 
-"Aaj hum Python ke variables seekhenge."
-
-OTHER INDIAN LANGUAGES:
-
-Use their appropriate native scripts whenever possible.
-
-Examples:
-
-Bengali → বাংলা
-Tamil → தமிழ்
-Telugu → తెలుగు
-Gujarati → ગુજરાતી
-Punjabi → ਪੰਜਾਬੀ
-Kannada → ಕನ್ನಡ
-Malayalam → മലയാളം
-Odia → ଓଡ଼ିଆ
-Marathi → देवनागरी
-
-If the user switches language, smoothly switch to the new language.
-
-Never force English when the user prefers Hindi or another language.
-
-Never force Hindi when the user prefers English.
-
-For technical terms such as Python, JavaScript, HTML, CSS, SQL, API, AI, or LiveKit, keep the technical term in its standard form when appropriate.
+If no memory exists, treat the learner as new.
 
 
-SPOKEN ENGLISH PRACTICE
+============================================================
+OUTBOUND CALL — DAY 6
+============================================================
 
-When the learner wants to practice English:
+This agent can make outbound daily learning practice calls.
 
-- Encourage them to speak naturally.
-- Correct mistakes politely.
-- Give short explanations.
-- Provide a better version of their sentence.
-- Encourage them to try again.
-- Never embarrass or discourage them.
+The purpose of the outbound call is:
+
+"Daily Learning Practice"
+
+At the beginning of an outbound call:
+
+1. Clearly introduce ShikshaMitra AI.
+2. Explain why you are calling.
+3. Tell the learner they can ask you to stop future calls.
+4. Ask whether this is a good time.
 
 Example:
 
-Learner:
-"I am go to college yesterday."
+"Hello, this is ShikshaMitra AI. I'm calling for your daily
+learning practice. If you don't want these calls, just tell me
+and I'll stop. Is now a good time?"
 
-Response:
+Do NOT immediately start asking questions.
 
-"A better sentence is: 'I went to college yesterday.' Try saying it once more."
+Wait for the learner to confirm that they are ready.
 
+If the learner says:
+- they are busy
+- not interested
+- stop calling
+- don't call again
 
-TEACHING STYLE
+politely end the conversation.
 
-When teaching:
+If the learner agrees:
 
-1. Start with a simple explanation.
-2. Break difficult concepts into small steps.
-3. Use practical and relatable examples.
-4. Ask short questions to keep the learner involved.
-5. Encourage the learner.
-6. Adapt explanations to the learner's level.
-7. If the learner struggles, simplify the explanation.
-8. If the learner understands quickly, gradually increase the difficulty.
+"Great! Let's do a short learning practice session."
 
-Never make the learner feel embarrassed for making mistakes.
+Then ask what they would like to practice, or use their remembered
+learning topic when appropriate.
 
+Use the Day 5 exercise tools during the practice.
 
-PYTHON / PROGRAMMING MODE
-
-For programming questions:
-
-- Explain the logic first.
-- Then explain the code.
-- Use beginner-friendly examples.
-- Explain errors clearly.
-- Avoid unnecessary complexity.
-- Encourage the learner to understand the solution instead of blindly copying it.
+Keep outbound calls short, friendly, and useful.
 
 
-MATHEMATICS MODE
+============================================================
+OUTBOUND CALL BEHAVIOR
+============================================================
 
-For mathematics:
+Outbound calls are different from normal browser conversations.
 
-- Explain step by step.
-- Show important reasoning.
-- Use simple examples.
-- Do not skip important steps.
-- Ask the learner to try a similar problem when appropriate.
-
-
-SCIENCE MODE
-
-For science:
-
-- Explain concepts clearly.
-- Use everyday examples whenever possible.
-- Avoid unnecessary technical jargon.
-- Encourage curiosity and questions.
-
-
-STUDY GUIDANCE
-
-Help learners understand concepts, create study strategies, practice questions, and improve their understanding.
-
-Do not encourage cheating.
-
-Do not provide answers to active exams or confidential examination questions.
-
-
-GUARDRAILS
-
-Never:
-
-- Shame a learner.
-- Insult a learner.
-- Call a learner weak, stupid, or slow.
-- Discourage a learner.
-- Diagnose a learning disability.
-- Claim that a learner has a medical or psychological condition.
-- Help with cheating.
-- Complete an exam for the learner.
-- Provide confidential exam answers.
-- Generate fake certificates.
-- Generate fake academic documents.
-- Store sensitive personal information.
-
-Always encourage independent learning.
-
-
-OUT-OF-SCOPE REQUESTS
-
-If the user asks for something outside your role, politely explain that you cannot help with that request and redirect them toward something educational that you can help with.
-
-Use a friendly response such as:
-
-"I'm sorry, but I can't help with that request. However, I'd be happy to explain the topic, teach it step by step, or help you learn how to solve it yourself."
-
-
-VOICE STYLE
-
-This is a voice conversation.
+The learner did not initiate the call.
 
 Therefore:
 
-- Keep responses short and natural.
-- Prefer 2–4 short sentences.
+- Be concise.
+- Identify yourself immediately.
+- Explain the reason for calling.
+- Ask permission to continue.
+- Respect "no".
+- Never pressure the learner.
+- Never repeatedly call during the same session.
+- Do not continue if the learner asks to stop.
+
+
+============================================================
+TEACHING STYLE
+============================================================
+
+Teach like a friendly personal teacher.
+
+- Keep explanations simple.
+- Use practical examples.
+- Break difficult concepts into steps.
+- Encourage the learner.
+- Correct mistakes politely.
+- Adapt to the learner's level.
+- Ask short follow-up questions.
+- Encourage independent thinking.
+
+For voice conversations:
+
+- Keep replies around 2-4 short sentences.
 - Avoid long paragraphs.
-- Avoid unnecessary lists.
-- Do not speak like a textbook.
-- Use conversational language.
-- Be warm, calm, patient, and encouraging.
-- Pause naturally between ideas.
-- Ask a short follow-up question when appropriate.
-- Do not overload the learner with information unless they ask for detailed explanation.
+- Sound natural.
+- Do not sound like a textbook.
+- Avoid unnecessary technical jargon.
 
 
-PERSONALITY
+============================================================
+PYTHON / PROGRAMMING
+============================================================
 
-You are:
+For programming:
 
-- Friendly
-- Patient
-- Supportive
-- Intelligent
-- Curious
-- Encouraging
-- Calm
-- Positive
-
-You behave like a friendly personal teacher who remembers useful learning progress when the learner gives permission.
+- explain the logic first
+- use simple examples
+- explain errors clearly
+- avoid unnecessary complexity
+- encourage understanding instead of blind copying
 
 
+============================================================
+MATHEMATICS
+============================================================
+
+For mathematics:
+
+- explain step by step
+- show important reasoning
+- use simple examples
+- encourage the learner to try similar problems
+
+
+============================================================
+COMPUTER SCIENCE
+============================================================
+
+For Computer Science:
+
+Focus on beginner-friendly topics such as:
+
+- CPU
+- RAM
+- ROM
+- binary numbers
+- algorithms
+- data structures
+- operating systems
+- networking
+- databases
+- HTML
+- basic programming concepts
+
+Use simple real-world examples whenever possible.
+
+
+============================================================
+GUARDRAILS
+============================================================
+
+Never:
+
+- shame the learner
+- insult the learner
+- discourage the learner
+- diagnose learning disabilities
+- help with cheating
+- provide active exam answers
+- generate fake certificates
+- generate fake academic documents
+- store sensitive information
+
+Help the learner understand concepts instead.
+
+
+============================================================
+HUMAN HELP POLICY — DAY 7
+============================================================
+
+ShikshaMitra should consider requesting human teacher help when:
+
+1. The learner is clearly upset, frustrated, or struggling and
+   teacher support would be genuinely useful.
+
+   Examples:
+   - "मुझे कुछ समझ नहीं आ रहा।"
+   - "मैं बहुत परेशान हो गया हूँ।"
+   - "I don't understand this."
+   - "I'm getting really frustrated."
+
+2. The learner explicitly asks for a teacher.
+
+   Examples:
+   - "मुझे शिक्षक से बात करनी है।"
+   - "Can I talk to a teacher?"
+   - "मुझे टीचर की मदद चाहिए।"
+
+Before creating an escalation:
+
+- Acknowledge the learner's difficulty.
+- Explain why teacher help may be useful.
+- Tell the learner what information will be shared
+  (a short summary of the problem, nothing private).
+- Ask for explicit permission.
+
+Consent rules:
+
+- Only create escalation when the learner clearly says YES.
+- Silence is NOT consent.
+- "Maybe" is NOT consent.
+- If unclear, ask again.
+- If the learner says NO, do NOT create any escalation.
+  Continue helping normally.
+
+After a successful escalation:
+
+- Give the reference ID to the learner.
+- Tell the learner the request status is OPEN.
+- Explain the honest next step.
+- NEVER promise immediate teacher response unless the system
+  actually guarantees it.
+
+Normal learning questions must NEVER trigger an escalation.
+
+"Python में loop क्या होता है?" → answer normally, no escalation.
+"Give me a Python question." → continue practice, no escalation.
+
+
+============================================================
+ESCALATION CONSENT LANGUAGE
+============================================================
+
+The consent message MUST follow the learner's language.
+
+Hindi:
+"मैं आपकी समस्या का एक छोटा सा सारांश शिक्षक के साथ साझा
+करके मदद का अनुरोध भेज सकता हूँ। क्या मैं ऐसा करूं?"
+
+English:
+"I can share a short summary of your problem with a teacher
+and request help. Would you like me to do that?"
+
+Hinglish:
+"मैं आपकी problem का एक short summary teacher के साथ share
+करके help request भेज सकता हूँ। क्या मैं ऐसा करूं?"
+
+The confirmation message must also follow the language:
+
+Hindi:
+"आपका शिक्षक-सहायता अनुरोध बना दिया गया है। आपका reference
+ID है ESC-XXXXXX।"
+
+English:
+"Your teacher-help request has been created. Your reference ID
+is ESC-XXXXXX."
+
+If the learner says NO:
+
+Hindi:
+"ठीक है। मैं आपकी जानकारी साझा नहीं करूंगा और कोई
+teacher-help request नहीं बनाऊंगा। मैं यहीं आपकी मदद करने
+की कोशिश करता हूँ।"
+
+English:
+"Okay. I won't share your information or create a teacher-help
+request. Let me continue helping you here."
+
+
+============================================================
+DAY 9 — MATHS PRACTICE SPECIALIST HANDOFF
+============================================================
+
+You have a dedicated Maths Practice Specialist (`MathsPracticeAgent`)
+for interactive, step-by-step Mathematics practice.
+
+WHEN TO HANDOFF:
+When the learner specifically requests:
+- Maths practice ("Mujhe maths practice karni hai", "Maths practice karwao")
+- Maths quiz, test, or exercises ("Mera maths test lo", "Take my maths test")
+- Specific topic practice ("Mujhe percentage ke questions practice karne hain", "Algebra ke 5 questions do")
+- Practice in fractions, decimals, percentages, ratios, algebra, arithmetic, geometry, word problems.
+
+WHEN NOT TO HANDOFF:
+- Simple factual single calculation questions that you can answer directly in 1 short sentence (e.g. "2 + 2 kitna hota hai?" -> "2 + 2 = 4 होता है।")
+- General questions about what a concept means if practice was not requested.
+- Other subjects (Computer Science, Python, Science, English, GK) MUST stay with you and NEVER hand off to Maths Specialist.
+
+HOW TO ANNOUNCE AND HANDOFF:
+1. Announce the handoff briefly and naturally in the learner's language:
+   - Hindi/Hinglish: "ज़रूर! Maths की practice के लिए मैं आपको अपने Maths Practice Specialist से connect करता हूँ।"
+   - English: "Sure! For Maths practice, I am connecting you with our Maths Practice Specialist."
+2. Call the tool `handoff_to_maths_specialist` with `topic` (e.g. "percentage", "fractions", "algebra", "arithmetic", "geometry") and `specific_request`.
+3. Do NOT make the announcement long.
+
+
+============================================================
 FIRST GREETING
+============================================================
 
-When a completely new conversation starts and no returning-memory greeting is available, say:
+For a completely new learner:
 
-"Hello! I'm ShikshaMitra AI, your personal learning assistant built using Murf Falcon for the VoiceForBharat Edition.
+"Hello! I'm ShikshaMitra AI, your personal learning assistant
+built using Murf Falcon for the VoiceForBharat Edition.
 
-I can help you learn Python, improve your spoken English, understand Maths and Science, and explore Technology and many other subjects.
-
-You can talk to me in English, Hindi, or Hinglish, and I'll reply naturally in the same language.
-
-What would you like to learn today?"
+I can help you learn Computer Science, Python, Maths, Science,
+and spoken English. You can speak with me in English, Hindi,
+or Hinglish. What would you like to learn today?"
 """
 
+
+# ============================================================
+# ASSISTANT
+# ============================================================
+
+
 class Assistant(Agent):
-    def __init__(self, user_id: str, prior_memory: str | None = None) -> None:
+    def __init__(
+        self,
+        user_id: str = "anonymous",
+        prior_memory: str | None = None,
+        outbound_call: bool = False,
+        call_id: str | None = None,
+    ) -> None:
+
         self.user_id = user_id
+        self.outbound_call = outbound_call
+        self.call_id = call_id
+
+        # Avoid repeating exercises in the same call.
+        self.used_exercise_ids: list[int] = []
+
         instructions = SYSTEM_PROMPT
+
+        if outbound_call:
+            instructions += """
+
+OUTBOUND SESSION MODE
+
+This is an outbound daily learning practice call.
+
+When the session begins:
+Do not use the standard long first greeting.
+Identify ShikshaMitra AI, explain why you are calling, tell the learner they can ask to stop future calls at any time, and ask if now is a good time for a quick practice.
+
+Wait for the learner's response before starting exercises.
+
+If the learner agrees or says yes:
+Start a short Computer Science practice session using fetch_next_exercise and score_spoken_answer.
+
+If the learner says no, busy, not interested, or asks to stop calling:
+Politely say: "No problem. I won't keep you. Have a great day!" and gracefully end the call.
+"""
+
         if prior_memory:
-            instructions = f"{SYSTEM_PROMPT}\n\n{prior_memory}"
+            instructions += "\n\nRETURNING LEARNER CONTEXT:\n" + prior_memory
+
         super().__init__(instructions=instructions)
 
+    # ========================================================
+    # MEMORY LOOKUP
+    # ========================================================
+
     @function_tool
-    async def lookup_user_memory(self, context: RunContext):
-        """Lookup persistent memory for the learner associated with this session."""
-        return lookup_user_memory(self.user_id)
+    async def lookup_user_memory(
+        self,
+        context: RunContext,
+    ):
+        """Look up persistent learning memory for the current learner."""
+
+        try:
+            return lookup_user_memory(self.user_id)
+
+        except Exception:
+            logger.exception("Memory lookup failed")
+
+            return {
+                "success": False,
+                "message": ("Memory is temporarily unavailable. Continue normally."),
+            }
+
+    # ========================================================
+    # SAVE MEMORY
+    # ========================================================
 
     @function_tool
     async def save_user_memory(
@@ -414,157 +691,688 @@ class Assistant(Agent):
         current_topic: str | None = None,
         topics_covered: list[str] | None = None,
     ):
-        """Save learner memory only after the user explicitly agrees."""
+        """Save useful learner information only after explicit consent."""
+
         facts: dict[str, object] = {}
-        if learning_level is not None:
+
+        if learning_level:
             facts["learning_level"] = learning_level
-        if current_topic is not None:
+
+        if current_topic:
             facts["current_topic"] = current_topic
-        if topics_covered is not None:
+
+        if topics_covered:
             facts["topics_covered"] = topics_covered
-        return save_user_memory(
-            self.user_id,
-            name,
-            language_preference,
-            facts,
+
+        try:
+            result = save_user_memory(
+                self.user_id,
+                name,
+                language_preference,
+                facts,
+            )
+
+            return result
+
+        except Exception:
+            logger.exception("Memory save failed")
+
+            return "Memory could not be saved. Do not claim that it was saved."
+
+    # ========================================================
+    # FETCH EXERCISE
+    # ========================================================
+
+    @function_tool
+    async def fetch_next_exercise(
+        self,
+        context: RunContext,
+        learning_level: str | None = None,
+        current_topic: str | None = None,
+    ):
+        """Fetch the next suitable learning exercise."""
+
+        try:
+            # If information is missing, try learner memory.
+            if learning_level is None or current_topic is None:
+                memory_result = lookup_user_memory(self.user_id)
+
+                if isinstance(
+                    memory_result,
+                    dict,
+                ):
+                    facts = (
+                        memory_result.get(
+                            "facts",
+                            {},
+                        )
+                        or {}
+                    )
+
+                    if learning_level is None:
+                        learning_level = facts.get("learning_level")
+
+                    if current_topic is None:
+                        current_topic = facts.get("current_topic")
+
+            # Defaults
+            if not learning_level:
+                learning_level = "beginner"
+
+            if not current_topic:
+                current_topic = "computer science"
+
+            result = find_next_exercise(
+                learning_level,
+                current_topic,
+                self.used_exercise_ids,
+            )
+
+            if result.get("success") and result.get("exercise"):
+                exercise_id = result["exercise"].get("id")
+
+                if (
+                    exercise_id is not None
+                    and exercise_id not in self.used_exercise_ids
+                ):
+                    self.used_exercise_ids.append(exercise_id)
+
+            return result
+
+        except Exception:
+            logger.exception("Exercise fetch failed")
+
+            return {
+                "success": False,
+                "error": "tool_failure",
+                "message": (
+                    "I couldn't fetch a practice question right now. Let's try again."
+                ),
+            }
+
+    # ========================================================
+    # SCORE SPOKEN ANSWER
+    # ========================================================
+
+    @function_tool
+    async def score_spoken_answer(
+        self,
+        context: RunContext,
+        question: str,
+        expected_answer: str,
+        learner_answer: str,
+    ):
+        """
+        Evaluate the learner's spoken answer and record it
+        in the current learning session score.
+        """
+
+        try:
+            result = score_and_record_answer(
+                session_id=self.user_id,
+                question=question,
+                expected_answer=expected_answer,
+                learner_answer=learner_answer,
+            )
+
+            if result.get("correct") and self.call_id:
+                mark_exercise_completed(self.call_id)
+
+            return result
+
+        except Exception:
+            logger.exception("Answer scoring failed")
+
+            return {
+                "success": False,
+                "score": 0.0,
+                "correct": False,
+                "feedback": (
+                    "I couldn't score that answer right now. Let's try again."
+                ),
+            }
+
+    # ========================================================
+    # GET SCORE
+    # ========================================================
+
+    @function_tool
+    async def get_learning_score(
+        self,
+        context: RunContext,
+    ):
+        """Return the learner's current score for this session."""
+
+        try:
+            result = format_session_score(self.user_id)
+
+            return result
+
+        except Exception:
+            logger.exception("Score lookup failed")
+
+            return {
+                "success": False,
+                "message": ("I couldn't calculate your score right now."),
+            }
+
+    # ========================================================
+    # CREATE ESCALATION — DAY 7
+    # ========================================================
+
+    @function_tool
+    async def create_escalation(
+        self,
+        context: RunContext,
+        reason: str,
+        summary: str,
+        already_checked: str = "",
+        urgency: str = "MEDIUM",
+        language: str = "English",
+        preferred_follow_up: str = "voice",
+        learner_name: str | None = None,
+    ):
+        """
+        Create a human teacher help request.
+
+        Only call this tool AFTER the learner has given
+        explicit consent to share their information.
+
+        Parameters:
+            reason: Why human help is needed
+                    (e.g. "Frustrated Learner" or "Teacher Help")
+            summary: Short summary of the learner's problem
+            already_checked: What ShikshaMitra already tried
+            urgency: LOW, MEDIUM, or HIGH
+            language: Hindi, English, or Hinglish
+            preferred_follow_up: voice, text, or dashboard
+            learner_name: Name of learner if available
+        """
+
+        logger.info("[ESCALATION] Human help needed")
+        logger.info("[ESCALATION] Reason: %s", reason)
+        logger.info("[ESCALATION] Language detected: %s", language)
+        logger.info("[ESCALATION] Consent requested")
+        logger.info("[ESCALATION] Consent granted")
+        logger.info("[ESCALATION] Creating request")
+
+        try:
+            result = create_escalation_record(
+                learner_id=self.user_id,
+                reason=reason,
+                summary=summary,
+                already_checked=already_checked,
+                urgency=urgency,
+                language=language,
+                preferred_follow_up=preferred_follow_up,
+                learner_name=learner_name,
+            )
+
+            if result.get("success"):
+                if result.get("duplicate"):
+                    logger.info("[ESCALATION] Duplicate found")
+                    logger.info(
+                        "[ESCALATION] Returning existing request %s",
+                        result.get("reference_id"),
+                    )
+                else:
+                    logger.info(
+                        "[ESCALATION] Created %s",
+                        result.get("reference_id"),
+                    )
+                    logger.info(
+                        "[ESCALATION] Status: %s",
+                        result.get("status"),
+                    )
+                    logger.info("[ESCALATION] Dashboard persistence successful")
+            else:
+                logger.warning("[ESCALATION] Failed to create request")
+
+            return result
+
+        except Exception:
+            logger.exception("[ESCALATION] Escalation creation failed")
+            return {
+                "success": False,
+                "message": (
+                    "I couldn't create the teacher help "
+                    "request right now. Let me try to "
+                    "help you myself."
+                ),
+            }
+
+    # ========================================================
+    # HANDOFF TO MATHS SPECIALIST — DAY 9
+    # ========================================================
+
+    @function_tool
+    async def handoff_to_maths_specialist(
+        self,
+        context: RunContext,
+        topic: str = "Mathematics",
+        specific_request: str = "",
+        learning_level: str = "beginner",
+    ):
+        """
+        Hand off the conversation to the dedicated Maths Practice Specialist (MathsPracticeAgent).
+
+        Call this tool when the learner requests:
+        - Maths practice (e.g., "Mujhe maths practice karni hai", "Percentage ke questions practice karwao")
+        - Maths quiz or test (e.g., "Mera maths test lo", "Take my maths test")
+        - Maths exercises / solving multiple Maths questions (e.g., "Mujhe fractions ke 5 questions do")
+        - Step-by-step practice for topics like percentages, fractions, decimals, algebra, arithmetic, geometry.
+
+        DO NOT call this tool for:
+        - Simple factual single calculation questions (e.g., "2 + 2 kitna hota hai?") that can be answered directly.
+        - Non-Maths subjects (Python, Computer Science, Science, English, GK).
+
+        Parameters:
+            topic: Specific mathematics topic (e.g., "percentage", "fractions", "algebra", "arithmetic", "geometry").
+            specific_request: The specific request or problem stated by the learner.
+            learning_level: "beginner", "intermediate", or "advanced".
+        """
+        logger.info(
+            "[HANDOFF] Transferring to Maths Practice Specialist. Topic='%s', Request='%s', Level='%s'",
+            topic,
+            specific_request,
+            learning_level,
         )
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+        try:
+            maths_agent = MathsPracticeAgent(
+                user_id=self.user_id,
+                topic=topic,
+                initial_context=specific_request or topic,
+                learning_level=learning_level,
+                call_id=self.call_id,
+            )
 
+            # Perform real LiveKit Agent handoff
+            self.session.update_agent(maths_agent)
+
+            return {
+                "success": True,
+                "status": "HANDOFF_COMPLETED",
+                "topic": topic,
+                "message": (
+                    f"Successfully connected to Maths Practice Specialist for {topic}."
+                ),
+            }
+        except Exception as exc:
+            logger.exception("[HANDOFF] Failed to transfer to Maths Specialist: %s", exc)
+            return {
+                "success": False,
+                "status": "HANDOFF_FAILED",
+                "error": str(exc),
+                "message": (
+                    "माफ़ कीजिए, Maths specialist अभी उपलब्ध नहीं है। "
+                    "मैं आपके साथ Maths की मदद जारी रख सकता हूँ।"
+                ),
+            }
+
+
+# ============================================================
+# SERVER
+# ============================================================
 
 server = AgentServer()
 
 
+# ============================================================
+# PREWARM
+# ============================================================
+
+
 def prewarm(proc: JobProcess):
+
     initialize_database()
+    initialize_escalation_table()
+    initialize_call_analytics_table()
+
+    # Auto-start dashboard server (port 8765) in background thread
+    dashboard_thread = threading.Thread(target=run_dashboard, daemon=True)
+    dashboard_thread.start()
+    logger.info("Dashboard server thread launched on port 8765")
+
     proc.userdata["vad"] = silero.VAD.load()
 
 
 server.setup_fnc = prewarm
 
 
+# ============================================================
+# AGENT SESSION
+# ============================================================
+
+
 @server.rtc_session(agent_name="my-agent")
-async def my_agent(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
+async def my_agent(
+    ctx: JobContext,
+):
+
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
+    # --------------------------------------------------------
+    # Read outbound call metadata
+    # --------------------------------------------------------
+
+    dial_info: dict = {}
+
+    if ctx.job.metadata:
+        try:
+            dial_info = json.loads(ctx.job.metadata)
+            if not isinstance(
+                dial_info,
+                dict,
+            ):
+                dial_info = {}
+        except json.JSONDecodeError:
+            logger.warning(
+                "Invalid job metadata: %s",
+                ctx.job.metadata,
+            )
+
+    is_outbound = dial_info.get("outbound", False) or bool(
+        dial_info.get("phone_number")
+    )
+
+    if is_outbound:
+        logger.info(
+            "LOG Stage 1: Outbound call metadata detected (dial_info=%s)",
+            dial_info,
+        )
+
+    # --------------------------------------------------------
+    # Connect to LiveKit
+    # --------------------------------------------------------
+
     await ctx.connect()
-    participant = await ctx.wait_for_participant()
+
+    # --------------------------------------------------------
+    # Wait for Participant (Web or SIP)
+    # --------------------------------------------------------
+
+    try:
+        participant = await ctx.wait_for_participant()
+    except Exception as e:
+        logger.warning(
+            "LOG Outcome: No answer / Busy / Participant failed to join: %s",
+            e,
+        )
+        ctx.shutdown()
+        return
+
     learner_id = participant.identity
-    memory_record = lookup_user_memory(learner_id)
-    prior_memory = None
-    if isinstance(memory_record, dict) and memory_record.get("facts"):
-        facts = memory_record.get("facts", {})
-        name = memory_record.get("name") or "learner"
-        topic = facts.get("current_topic") or "your recent topic"
-        topics = ", ".join(facts.get("topics_covered", [])) if isinstance(facts.get("topics_covered"), list) else None
-        memory_lines = [
-            f"Previous learner name: {name}.",
-            f"Previous preferred language: {memory_record.get('language_preference')}.",
-        ]
-        if learning_level := facts.get("learning_level"):
-            memory_lines.append(f"Learning level: {learning_level}.")
-        if topic:
-            memory_lines.append(f"Last topic: {topic}.")
-        if topics:
-            memory_lines.append(f"Previously covered topics: {topics}.")
-        memory_summary = " ".join(memory_lines)
-        prior_memory = (
-            "A returning learner has joined this session. "
-            "Greet them naturally and use their memory to continue the lesson. "
-            f"If the learner is {name}, say: \"Welcome back, {name}! Last time you were learning {topic}. Would you like to continue?\" "
-            f"Use the stored facts: {memory_summary}"
+    call_id = ctx.room.name
+    channel = (
+        "sip"
+        if (is_outbound or participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP)
+        else "browser"
+    )
+
+    if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+        is_outbound = True
+        logger.info(
+            "LOG Stage 2: SIP Participant connected (Call Answered): %s",
+            learner_id,
         )
     else:
-        prior_memory = (
-            "No prior learning memory exists for this learner. "
-            "If they agree, ask explicitly: \"I can remember your name and learning progress for future sessions. Would you like me to remember that?\""
+        logger.info(
+            "Inbound learner connected: %s",
+            learner_id,
         )
 
-    assistant = Assistant(learner_id, prior_memory)
+    # Record call start in SQLite analytics
+    start_call_record(call_id=call_id, learner_id=learner_id, channel=channel)
 
-    # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
+    # Disconnect listener for call outcome tracking
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(p: rtc.RemoteParticipant):
+        logger.info(
+            "LOG Outcome: CALL DISCONNECTED - Participant %s left room",
+            p.identity,
+        )
+        end_call_record(call_id)
+
+    # --------------------------------------------------------
+    # Start a fresh score for this call
+    # --------------------------------------------------------
+
+    start_score_session(learner_id)
+
+    # --------------------------------------------------------
+    # Load persistent memory
+    # --------------------------------------------------------
+
+    prior_memory = None
+
+    try:
+        memory_record = lookup_user_memory(learner_id)
+
+        if isinstance(
+            memory_record,
+            dict,
+        ):
+            facts = (
+                memory_record.get(
+                    "facts",
+                    {},
+                )
+                or {}
+            )
+
+            name = memory_record.get("name")
+
+            language = memory_record.get("language_preference")
+
+            level = facts.get("learning_level")
+
+            topic = facts.get("current_topic")
+
+            topics = facts.get("topics_covered")
+
+            memory_lines = []
+
+            if name:
+                memory_lines.append(f"Learner name: {name}")
+
+            if language:
+                memory_lines.append(f"Preferred language: {language}")
+
+            if level:
+                memory_lines.append(f"Learning level: {level}")
+
+            if topic:
+                memory_lines.append(f"Current topic: {topic}")
+
+            if (
+                isinstance(
+                    topics,
+                    list,
+                )
+                and topics
+            ):
+                memory_lines.append(
+                    "Topics covered: " + ", ".join(str(item) for item in topics)
+                )
+
+            if memory_lines:
+                prior_memory = (
+                    "The learner has previous "
+                    "learning memory. Use it naturally "
+                    "without exposing technical details.\n" + "\n".join(memory_lines)
+                )
+
+    except Exception:
+        logger.exception("Failed to load learner memory")
+
+    # --------------------------------------------------------
+    # Create assistant
+    # --------------------------------------------------------
+
+    assistant = Assistant(
+        user_id=learner_id,
+        prior_memory=prior_memory,
+        outbound_call=is_outbound,
+        call_id=call_id,
+    )
+
+    # --------------------------------------------------------
+    # Voice AI pipeline
+    # --------------------------------------------------------
+
+    logger.info(
+        "LOG Stage 4: Starting AgentSession with Murf Falcon TTS, Deepgram STT, Gemini LLM"
+    )
+
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
-       stt=deepgram.STT(
-     model="nova-3",
-      language="multi"
-),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
+        # Speech-to-text (Nova-3 multilingual)
+        stt=deepgram.STT(
+            model="nova-3",
+            language="multi",
+        ),
+        # LLM
         llm=google.LLM(
-                model="gemini-3.5-flash-lite",
-            ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
+            model="gemini-3.5-flash-lite",
+        ),
+        # Murf Falcon
         tts=murf.TTS(
-         voice="Anisha",
-         style="Conversation",
-          tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-          text_pacing=True
-),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+            voice="Anisha",
+            style="Conversation",
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            text_pacing=True,
+        ),
+        # Multilingual turn detection
         turn_detection=MultilingualModel(),
+        # Voice activity detection
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
+        # Generate responses early
         preemptive_generation=True,
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
+    # --------------------------------------------------------
+    # Debug Event Listeners for STT / Audio / Turn Lifecycle
+    # --------------------------------------------------------
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
+    @ctx.room.on("participant_connected")
+    def _on_participant_connected(p: rtc.RemoteParticipant):
+        logger.info(
+            "LOG: Outbound participant joined: %s (kind=%s)",
+            p.identity,
+            p.kind,
+        )
 
-    # Start the session, which initializes the voice pipeline and warms up the models
+    @ctx.room.on("track_subscribed")
+    def _on_track_subscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ):
+        logger.info(
+            "LOG: Audio track subscribed for participant: %s (track_sid=%s, kind=%s)",
+            participant.identity,
+            track.sid,
+            track.kind,
+        )
+
+    @session.on("user_state_changed")
+    def _on_user_state_changed(ev):
+        logger.info(
+            "LOG: User state changed: %s -> %s",
+            ev.old_state,
+            ev.new_state,
+        )
+        if ev.new_state == "speaking":
+            logger.info("LOG: User turn detected")
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(ev):
+        logger.info(
+            "LOG: Agent state changed: %s -> %s",
+            ev.old_state,
+            ev.new_state,
+        )
+        if ev.new_state == "thinking":
+            logger.info("LOG: LLM response started")
+        elif ev.new_state == "speaking":
+            logger.info("LOG: TTS response started")
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(ev):
+        if ev.is_final:
+            logger.info(
+                "LOG: STT final transcript: %s",
+                ev.transcript,
+            )
+            logger.info(
+                "USER TRANSCRIPT: %s",
+                ev.transcript,
+            )
+        else:
+            logger.info(
+                "LOG: STT partial transcript: %s",
+                ev.transcript,
+            )
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev):
+        logger.info(
+            "LOG: Conversation item added (%s): %s",
+            ev.item.role,
+            ev.item.content,
+        )
+
+    # --------------------------------------------------------
+    # Start session
+    # --------------------------------------------------------
+
     await session.start(
         agent=assistant,
         room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
-                ),
-            ),
-        ),
     )
 
+    logger.info("LOG Stage 4: AgentSession started successfully")
+
+    # --------------------------------------------------------
+    # GREETING DISPATCH
+    # --------------------------------------------------------
+
+    if is_outbound:
+        logger.info("LOG Stage 5: Greeting generation started (Outbound mode)")
+
+        await session.generate_reply(
+            instructions=(
+                "Hello, this is ShikshaMitra AI. I'm calling to help you with your daily learning practice. "
+                "You can ask me to stop future calls at any time. Is this a good time for a quick learning practice?"
+            )
+        )
+
+        logger.info("LOG Stage 6: Outbound greeting completed")
+        logger.info("LOG Stage 7: Waiting for learner response...")
+
+    else:
+        # Normal browser/inbound greeting
+        await session.generate_reply(
+            instructions=(
+                "Greet the learner naturally. "
+                "If returning memory exists, personalize the greeting. "
+                "Otherwise introduce ShikshaMitra AI and ask what "
+                "the learner would like to learn."
+            )
+        )
+
+    logger.info(
+        "ShikshaMitra AI session running for %s | outbound=%s",
+        learner_id,
+        is_outbound,
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
     cli.run_app(server)
